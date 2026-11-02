@@ -90,6 +90,11 @@ pub const ALL_PROVIDERS: &[ProviderInfo] = &[
 ];
 
 impl ProviderInfo {
+    /// Providers with an empty `env_key` run locally and need no API key.
+    pub fn requires_key(&self) -> bool {
+        !self.env_key.is_empty()
+    }
+
     /// Get provider info by type
     pub fn for_provider(provider: ProviderType) -> &'static ProviderInfo {
         ALL_PROVIDERS

@@ -17,7 +17,10 @@ pub struct LumenConfig {
     pub provider: ProviderType,
     pub model: Option<String>,
     pub base_url: Option<String>,
-    pub api_key: Option<String>,
+    /// Key from the `-k` flag.
+    pub cli_api_key: Option<String>,
+    /// Deprecated plaintext key from the config file.
+    pub file_api_key: Option<String>,
     pub draft: DraftConfig,
     pub theme: Option<String>,
     pub wrap: Option<bool>,
@@ -45,7 +48,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub model: Option<String>,
 
-    #[serde(default = "default_api_key")]
+    /// Deprecated plaintext key. Prefer the secure store (`lumen configure`).
+    #[serde(default)]
     pub api_key: Option<String>,
 
     #[serde(default)]
@@ -102,10 +106,6 @@ fn default_commit_types() -> String {
     }
     "#}
     .to_string()
-}
-
-fn default_api_key() -> Option<String> {
-    std::env::var("LUMEN_API_KEY").ok()
 }
 
 fn deserialize_commit_types<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -175,13 +175,13 @@ impl LumenConfig {
             .providers
             .get(ProviderInfo::for_provider(provider).id)
             .and_then(|p| p.base_url.clone());
-        let api_key = cli.api_key.clone().or(file.api_key);
 
         LumenConfig {
             provider,
             model,
             base_url,
-            api_key,
+            cli_api_key: cli.api_key.clone(),
+            file_api_key: file.api_key,
             draft: file.draft,
             theme: file.theme,
             wrap: file.wrap,
@@ -203,7 +203,7 @@ impl Default for FileConfig {
         FileConfig {
             provider: default_ai_provider(),
             model: None,
-            api_key: default_api_key(),
+            api_key: None,
             providers: HashMap::new(),
             draft: default_draft_config(),
             theme: None,
