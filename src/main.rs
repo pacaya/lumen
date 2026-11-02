@@ -34,9 +34,6 @@ async fn run() -> Result<(), LumenError> {
         Err(e) => return Err(e),
     };
 
-    let provider = provider::LumenProvider::new(config.provider, config.api_key, config.model)?;
-    let command = command::LumenCommand::new(provider);
-
     // Get VCS backend based on CLI override or auto-detection
     let cwd = std::env::current_dir()?;
     let vcs_override = cli.vcs.map(VcsBackendType::from);
@@ -93,13 +90,13 @@ async fn run() -> Result<(), LumenError> {
                 }
             };
 
-            command
+            build_command(&config)?
                 .execute(command::CommandType::Explain { git_entity, query })
                 .await?;
         }
         Commands::List => {
             eprintln!("Warning: 'lumen list' is deprecated. Use 'lumen explain --list' instead.");
-            command
+            build_command(&config)?
                 .execute(command::CommandType::List {
                     backend: backend.as_ref(),
                 })
@@ -109,7 +106,7 @@ async fn run() -> Result<(), LumenError> {
             // Draft always uses staged diff (git convention)
             let diff = backend.get_working_tree_diff(true)?;
             let git_entity = GitEntity::Diff(Diff::from_working_tree_diff(diff, true)?);
-            command
+            build_command(&config)?
                 .execute(command::CommandType::Draft {
                     git_entity,
                     context,
@@ -118,7 +115,7 @@ async fn run() -> Result<(), LumenError> {
                 .await?
         }
         Commands::Operate { query } => {
-            command
+            build_command(&config)?
                 .execute(command::CommandType::Operate { query })
                 .await?;
         }
@@ -154,6 +151,28 @@ async fn run() -> Result<(), LumenError> {
     }
 
     Ok(())
+}
+
+/// Builds the AI command. Only AI commands resolve the API key, so `diff` and
+/// `configure` never touch the secret store.
+fn build_command(config: &LumenConfig) -> Result<LumenCommand, LumenError> {
+    let info = config::ProviderInfo::for_provider(config.provider);
+    let env = |name: &str| std::env::var(name).ok();
+    let api_key = config::secrets::resolve_api_key(
+        info,
+        config.cli_api_key.as_deref(),
+        config.file_api_key.as_deref(),
+        &env,
+        &config::secrets::OsKeychain,
+        &mut |w| eprintln!("\x1b[93mwarning:\x1b[0m {w}"),
+    )?;
+    let provider = provider::LumenProvider::new(
+        config.provider,
+        api_key,
+        config.model.clone(),
+        config.base_url.clone(),
+    )?;
+    Ok(LumenCommand::new(provider))
 }
 
 fn read_from_stdin() -> Result<String, LumenError> {

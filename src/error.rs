@@ -29,6 +29,9 @@ pub enum LumenError {
     #[error("{0}")]
     CommandError(String),
 
+    #[error("{0}")]
+    MissingApiKey(String),
+
     #[error(transparent)]
     ProviderError(#[from] ProviderError),
 
