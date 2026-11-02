@@ -1,4 +1,5 @@
 use crate::config::cli::ProviderType;
+use crate::config::ProviderInfo;
 use crate::error::LumenError;
 use dirs::home_dir;
 use indoc::indoc;
@@ -10,19 +11,45 @@ use std::io::BufReader;
 
 use crate::Cli;
 
-#[derive(Debug, Deserialize)]
+/// Settings resolved from CLI flags, the config file, and environment variables.
+#[derive(Debug)]
 pub struct LumenConfig {
+    pub provider: ProviderType,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub draft: DraftConfig,
+    pub theme: Option<String>,
+    pub wrap: Option<bool>,
+}
+
+/// Per-provider settings under the `providers` object of the config file.
+#[derive(Debug, Deserialize, Default, Clone, PartialEq)]
+pub struct ProviderSettings {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+/// The config file as written on disk.
+#[derive(Debug, Deserialize)]
+pub struct FileConfig {
     #[serde(
         default = "default_ai_provider",
         deserialize_with = "deserialize_ai_provider"
     )]
     pub provider: ProviderType,
 
-    #[serde(default = "default_model")]
+    /// Legacy top-level model. `providers.<id>.model` has priority.
+    #[serde(default)]
     pub model: Option<String>,
 
     #[serde(default = "default_api_key")]
     pub api_key: Option<String>,
+
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderSettings>,
 
     #[serde(default = "default_draft_config")]
     pub draft: DraftConfig,
@@ -77,10 +104,6 @@ fn default_commit_types() -> String {
     .to_string()
 }
 
-fn default_model() -> Option<String> {
-    std::env::var("LUMEN_AI_MODEL").ok()
-}
-
 fn default_api_key() -> Option<String> {
     std::env::var("LUMEN_API_KEY").ok()
 }
@@ -108,54 +131,150 @@ fn default_config_path() -> Option<String> {
     })
 }
 
+/// Model precedence: `-m`, then `providers.<active>.model`, then the legacy
+/// top-level `model`, then `LUMEN_AI_MODEL`. `None` means the provider default.
+fn resolve_model(
+    cli_model: Option<&str>,
+    file: &FileConfig,
+    provider: ProviderType,
+    env_model: Option<String>,
+) -> Option<String> {
+    let provider_id = ProviderInfo::for_provider(provider).id;
+    cli_model
+        .map(str::to_string)
+        .or_else(|| {
+            file.providers
+                .get(provider_id)
+                .and_then(|p| p.model.clone())
+        })
+        .or_else(|| file.model.clone())
+        .or(env_model)
+}
+
 impl LumenConfig {
     pub fn build(cli: &Cli) -> Result<Self, LumenError> {
-        let config = if let Some(config_path) = &cli.config {
-            LumenConfig::from_file(config_path)?
+        let file = if let Some(config_path) = &cli.config {
+            FileConfig::from_file(config_path)?
         } else {
             match default_config_path() {
-                Some(path) => LumenConfig::from_file(&path)?,
-                None => LumenConfig::default(),
+                Some(path) => FileConfig::from_file(&path)?,
+                None => FileConfig::default(),
             }
         };
-
-        let provider = cli.provider.as_ref().cloned().unwrap_or(config.provider);
-        let api_key = cli.api_key.clone().or(config.api_key);
-        let model = cli.model.clone().or(config.model);
-
-        Ok(LumenConfig {
-            provider,
-            model,
-            api_key,
-            draft: config.draft,
-            theme: config.theme,
-            wrap: config.wrap,
-        })
+        Ok(Self::resolve(
+            cli,
+            file,
+            std::env::var("LUMEN_AI_MODEL").ok(),
+        ))
     }
 
+    fn resolve(cli: &Cli, file: FileConfig, env_model: Option<String>) -> Self {
+        let provider = cli.provider.unwrap_or(file.provider);
+        let model = resolve_model(cli.model.as_deref(), &file, provider, env_model);
+        let base_url = file
+            .providers
+            .get(ProviderInfo::for_provider(provider).id)
+            .and_then(|p| p.base_url.clone());
+        let api_key = cli.api_key.clone().or(file.api_key);
+
+        LumenConfig {
+            provider,
+            model,
+            base_url,
+            api_key,
+            draft: file.draft,
+            theme: file.theme,
+            wrap: file.wrap,
+        }
+    }
+}
+
+impl FileConfig {
     pub fn from_file(file_path: &str) -> Result<Self, LumenError> {
         let file = File::open(file_path)?;
         let reader = BufReader::new(file);
 
-        // Deserialize JSON data into the LumenConfig struct
-        let config: LumenConfig = match from_reader(reader) {
-            Ok(config) => config,
-            Err(e) => return Err(LumenError::InvalidConfiguration(e.to_string())),
-        };
-
-        Ok(config)
+        from_reader(reader).map_err(|e| LumenError::InvalidConfiguration(e.to_string()))
     }
 }
 
-impl Default for LumenConfig {
+impl Default for FileConfig {
     fn default() -> Self {
-        LumenConfig {
+        FileConfig {
             provider: default_ai_provider(),
-            model: default_model(),
+            model: None,
             api_key: default_api_key(),
+            providers: HashMap::new(),
             draft: default_draft_config(),
             theme: None,
             wrap: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn file(json: &str) -> FileConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn cli(args: &[&str]) -> Cli {
+        let mut all = vec!["lumen"];
+        all.extend_from_slice(args);
+        all.push("draft");
+        Cli::try_parse_from(all).unwrap()
+    }
+
+    #[test]
+    fn cli_model_wins_over_everything() {
+        let f = file(
+            r#"{"provider":"deepseek","model":"top","providers":{"deepseek":{"model":"per"}}}"#,
+        );
+        let c = LumenConfig::resolve(&cli(&["-m", "flag"]), f, Some("env".into()));
+        assert_eq!(c.model.as_deref(), Some("flag"));
+    }
+
+    #[test]
+    fn provider_model_wins_over_top_level_and_env() {
+        let f = file(
+            r#"{"provider":"deepseek","model":"top","providers":{"deepseek":{"model":"per"}}}"#,
+        );
+        let c = LumenConfig::resolve(&cli(&[]), f, Some("env".into()));
+        assert_eq!(c.model.as_deref(), Some("per"));
+    }
+
+    #[test]
+    fn top_level_model_wins_over_env() {
+        let f = file(r#"{"provider":"deepseek","model":"top"}"#);
+        let c = LumenConfig::resolve(&cli(&[]), f, Some("env".into()));
+        assert_eq!(c.model.as_deref(), Some("top"));
+    }
+
+    #[test]
+    fn env_model_used_last() {
+        let f = file(r#"{"provider":"deepseek"}"#);
+        let c = LumenConfig::resolve(&cli(&[]), f, Some("env".into()));
+        assert_eq!(c.model.as_deref(), Some("env"));
+    }
+
+    #[test]
+    fn model_of_other_provider_is_not_used() {
+        let f = file(r#"{"provider":"claude","providers":{"deepseek":{"model":"deepseek-v4"}}}"#);
+        let c = LumenConfig::resolve(&cli(&[]), f, None);
+        assert_eq!(c.model, None);
+    }
+
+    #[test]
+    fn provider_flag_selects_that_providers_settings() {
+        let f = file(
+            r#"{"provider":"claude","providers":{"ollama":{"model":"qwen3","base_url":"http://box:11434/v1/"}}}"#,
+        );
+        let c = LumenConfig::resolve(&cli(&["-p", "ollama"]), f, None);
+        assert_eq!(c.provider, ProviderType::Ollama);
+        assert_eq!(c.model.as_deref(), Some("qwen3"));
+        assert_eq!(c.base_url.as_deref(), Some("http://box:11434/v1/"));
     }
 }

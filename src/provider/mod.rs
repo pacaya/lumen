@@ -34,11 +34,62 @@ pub struct LumenProvider {
     provider_name: String,
 }
 
-/// Provider configuration for custom endpoint providers (OpenCode Zen, OpenRouter, Vercel)
-struct CustomProviderConfig {
-    endpoint: &'static str,
-    env_key: &'static str,
-    adapter_kind: AdapterKind,
+/// Explicit genai adapter and default endpoint for a provider.
+///
+/// Every provider maps to its own adapter here. lumen never lets genai infer the
+/// adapter from the model name: genai falls back to Ollama for any name it does
+/// not know (for example a new DeepSeek model).
+fn genai_route(provider: ProviderType, model: &str) -> (AdapterKind, &'static str) {
+    match provider {
+        // OpenAI serves some models (codex, pro) only via the Responses API.
+        ProviderType::Openai => match AdapterKind::from_model(model) {
+            Ok(AdapterKind::OpenAIResp) => (AdapterKind::OpenAIResp, "https://api.openai.com/v1/"),
+            _ => (AdapterKind::OpenAI, "https://api.openai.com/v1/"),
+        },
+        ProviderType::Claude => (AdapterKind::Anthropic, "https://api.anthropic.com/v1/"),
+        ProviderType::Gemini => (
+            AdapterKind::Gemini,
+            "https://generativelanguage.googleapis.com/v1beta/",
+        ),
+        ProviderType::Xai => (AdapterKind::Xai, "https://api.x.ai/v1/"),
+        ProviderType::Deepseek => (AdapterKind::DeepSeek, "https://api.deepseek.com/v1/"),
+        ProviderType::Ollama => (AdapterKind::Ollama, "http://localhost:11434/v1/"),
+        ProviderType::Groq => (AdapterKind::OpenAI, "https://api.groq.com/openai/v1/"),
+        ProviderType::OpencodeZen => (AdapterKind::OpenAI, "https://opencode.ai/zen/v1/"),
+        ProviderType::Openrouter => (AdapterKind::OpenAI, "https://openrouter.ai/api/v1/"),
+        // Trailing slash is required for URL joining to work correctly
+        ProviderType::Vercel => (AdapterKind::OpenAI, "https://ai-gateway.vercel.sh/v1/"),
+    }
+}
+
+/// Builds the service target for a request. The endpoint and adapter come only
+/// from the provider (and the optional `base_url` override), never from the model name.
+fn service_target(
+    provider: ProviderType,
+    model: &str,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> ServiceTarget {
+    let defaults = ProviderInfo::for_provider(provider);
+    let (adapter_kind, default_endpoint) = genai_route(provider, model);
+
+    let endpoint = match base_url {
+        Some(url) if url.ends_with('/') => Endpoint::from_owned(url.to_string()),
+        Some(url) => Endpoint::from_owned(format!("{url}/")),
+        None => Endpoint::from_static(default_endpoint),
+    };
+
+    let auth = match api_key {
+        Some(key) => AuthData::from_single(key.to_string()),
+        None if defaults.env_key.is_empty() => AuthData::from_single(defaults.id.to_string()),
+        None => AuthData::from_env(defaults.env_key),
+    };
+
+    ServiceTarget {
+        endpoint,
+        auth,
+        model: ModelIden::new(adapter_kind, model.to_string()),
+    }
 }
 
 impl LumenProvider {
@@ -46,97 +97,29 @@ impl LumenProvider {
         provider_type: ProviderType,
         api_key: Option<String>,
         model: Option<String>,
+        base_url: Option<String>,
     ) -> Result<Self, LumenError> {
-        let (backend, provider_name) = match provider_type {
-            // Custom endpoint providers (OpenCode Zen, OpenRouter, Vercel) - use ServiceTargetResolver
-            ProviderType::OpencodeZen | ProviderType::Openrouter | ProviderType::Vercel | ProviderType::Groq => {
-                let defaults = ProviderInfo::for_provider(provider_type);
-                let config = match provider_type {
-                    ProviderType::OpencodeZen => CustomProviderConfig {
-                        endpoint: "https://opencode.ai/zen/v1/",
-                        env_key: defaults.env_key,
-                        adapter_kind: AdapterKind::OpenAI,
-                    },
-                    ProviderType::Openrouter => CustomProviderConfig {
-                        endpoint: "https://openrouter.ai/api/v1/",
-                        env_key: defaults.env_key,
-                        adapter_kind: AdapterKind::OpenAI,
-                    },
-                    ProviderType::Vercel => CustomProviderConfig {
-                        // Trailing slash is required for URL joining to work correctly
-                        endpoint: "https://ai-gateway.vercel.sh/v1/",
-                        env_key: defaults.env_key,
-                        adapter_kind: AdapterKind::OpenAI,
-                    },
-                    ProviderType::Groq => CustomProviderConfig {
-                        endpoint: "https://api.groq.com/openai/v1/",
-                        env_key: defaults.env_key,
-                        adapter_kind: AdapterKind::OpenAI,
-                    },
-                    _ => unreachable!(),
-                };
+        let defaults = ProviderInfo::for_provider(provider_type);
+        let model = model.unwrap_or_else(|| defaults.default_model.to_string());
 
-                let model = model.unwrap_or_else(|| defaults.default_model.to_string());
-                let model_for_resolver = model.clone();
+        let target_resolver = ServiceTargetResolver::from_resolver_fn(
+            move |target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                Ok(service_target(
+                    provider_type,
+                    &target.model.model_name,
+                    base_url.as_deref(),
+                    api_key.as_deref(),
+                ))
+            },
+        );
 
-                // Get API key from CLI/config or environment
-                let auth_env_key = config.env_key;
-                if let Some(key) = api_key {
-                    std::env::set_var(auth_env_key, key);
-                }
-
-                let endpoint = config.endpoint;
-                let adapter_kind = config.adapter_kind;
-
-                let target_resolver = ServiceTargetResolver::from_resolver_fn(
-                    move |service_target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                        let ServiceTarget { model, .. } = service_target;
-                        Ok(ServiceTarget {
-                            endpoint: Endpoint::from_static(endpoint),
-                            auth: AuthData::from_env(auth_env_key),
-                            model: ModelIden::new(adapter_kind, model.model_name),
-                        })
-                    },
-                );
-
-                let client = ClientBuilder::default()
-                    .with_service_target_resolver(target_resolver)
-                    .build();
-
-                (
-                    ProviderBackend::GenAI {
-                        client,
-                        model: model_for_resolver,
-                    },
-                    defaults.display_name.to_string(),
-                )
-            }
-            // Native genai providers
-            _ => {
-                let defaults = ProviderInfo::for_provider(provider_type);
-
-                let model = model.unwrap_or_else(|| defaults.default_model.to_string());
-
-                // If api_key provided via CLI/config, set it in env so genai picks it up
-                if let Some(key) = api_key {
-                    if !defaults.env_key.is_empty() {
-                        std::env::set_var(defaults.env_key, key);
-                    }
-                }
-
-                (
-                    ProviderBackend::GenAI {
-                        client: Client::default(),
-                        model,
-                    },
-                    defaults.display_name.to_string(),
-                )
-            }
-        };
+        let client = ClientBuilder::default()
+            .with_service_target_resolver(target_resolver)
+            .build();
 
         Ok(Self {
-            backend,
-            provider_name,
+            backend: ProviderBackend::GenAI { client, model },
+            provider_name: defaults.display_name.to_string(),
         })
     }
 
@@ -183,5 +166,80 @@ impl LumenProvider {
 impl std::fmt::Display for LumenProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.provider_name, self.get_model())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ALL_PROVIDERS;
+
+    fn expected_adapter(provider: ProviderType) -> AdapterKind {
+        match provider {
+            ProviderType::Openai
+            | ProviderType::Groq
+            | ProviderType::OpencodeZen
+            | ProviderType::Openrouter
+            | ProviderType::Vercel => AdapterKind::OpenAI,
+            ProviderType::Claude => AdapterKind::Anthropic,
+            ProviderType::Gemini => AdapterKind::Gemini,
+            ProviderType::Xai => AdapterKind::Xai,
+            ProviderType::Deepseek => AdapterKind::DeepSeek,
+            ProviderType::Ollama => AdapterKind::Ollama,
+        }
+    }
+
+    #[test]
+    fn deepseek_model_unknown_to_genai_routes_to_deepseek() {
+        let t = service_target(ProviderType::Deepseek, "deepseek-v4-pro", None, Some("k"));
+        assert_eq!(t.model.adapter_kind, AdapterKind::DeepSeek);
+        assert_eq!(t.endpoint.base_url(), "https://api.deepseek.com/v1/");
+    }
+
+    #[test]
+    fn model_name_never_changes_the_provider_route() {
+        // Names that genai would route elsewhere (Ollama fallback, Gemini, Anthropic, ...).
+        for name in [
+            "my-model",
+            "gemini-2.5-flash",
+            "claude-x",
+            "deepseek-chat",
+            "grok-4",
+        ] {
+            for info in ALL_PROVIDERS {
+                let t = service_target(info.provider_type, name, None, None);
+                assert_eq!(
+                    t.model.adapter_kind,
+                    expected_adapter(info.provider_type),
+                    "provider {} with model {name}",
+                    info.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn openai_responses_models_keep_the_responses_adapter() {
+        let t = service_target(ProviderType::Openai, "gpt-5-codex", None, None);
+        assert_eq!(t.model.adapter_kind, AdapterKind::OpenAIResp);
+    }
+
+    #[test]
+    fn base_url_override_replaces_endpoint_and_gets_trailing_slash() {
+        let t = service_target(
+            ProviderType::Ollama,
+            "llama3.2",
+            Some("http://box:11434/v1"),
+            None,
+        );
+        assert_eq!(t.endpoint.base_url(), "http://box:11434/v1/");
+    }
+
+    #[test]
+    fn explicit_key_is_used_otherwise_provider_env() {
+        let t = service_target(ProviderType::Deepseek, "deepseek-chat", None, Some("sk-1"));
+        assert!(matches!(t.auth, AuthData::Key(ref k) if k == "sk-1"));
+        let t = service_target(ProviderType::Deepseek, "deepseek-chat", None, None);
+        assert!(matches!(t.auth, AuthData::FromEnv(ref e) if e == "DEEPSEEK_API_KEY"));
     }
 }

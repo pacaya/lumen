@@ -34,7 +34,12 @@ async fn run() -> Result<(), LumenError> {
         Err(e) => return Err(e),
     };
 
-    let provider = provider::LumenProvider::new(config.provider, config.api_key, config.model)?;
+    let provider = provider::LumenProvider::new(
+        config.provider,
+        config.api_key.clone(),
+        config.model.clone(),
+        config.base_url.clone(),
+    )?;
     let command = command::LumenCommand::new(provider);
 
     // Get VCS backend based on CLI override or auto-detection
