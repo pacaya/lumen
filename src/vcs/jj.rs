@@ -107,6 +107,76 @@ fn should_exclude_path(path: &str) -> bool {
     false
 }
 
+/// Number of leading bytes checked for NUL when classifying binary content (same as git).
+const BINARY_PROBE_LEN: usize = 8000;
+
+/// File content read for a diff. Binary content is never written into the diff.
+#[derive(Debug, PartialEq)]
+enum DiffContent {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+impl DiffContent {
+    /// Classify raw bytes: a NUL byte in the first [`BINARY_PROBE_LEN`] bytes means binary.
+    fn from_bytes(bytes: Vec<u8>) -> Self {
+        if bytes.iter().take(BINARY_PROBE_LEN).any(|&b| b == 0) {
+            DiffContent::Binary(bytes)
+        } else {
+            DiffContent::Text(String::from_utf8_lossy(&bytes).into_owned())
+        }
+    }
+}
+
+/// Append one file's entry to a git-style unified diff.
+///
+/// When either side is binary, only the headers and a
+/// `Binary files <a> and <b> differ` line are written, as git does.
+fn format_diff_entry(
+    output: &mut String,
+    path_str: &str,
+    old_content: &Option<DiffContent>,
+    new_content: &Option<DiffContent>,
+) {
+    if old_content == new_content {
+        return;
+    }
+    output.push_str(&format!("diff --git a/{} b/{}\n", path_str, path_str));
+    match (old_content, new_content) {
+        (None, Some(_)) => output.push_str("new file mode 100644\n"),
+        (Some(_), None) => output.push_str("deleted file mode 100644\n"),
+        _ => {}
+    }
+    let old_label = match old_content {
+        Some(_) => format!("a/{}", path_str),
+        None => "/dev/null".to_string(),
+    };
+    let new_label = match new_content {
+        Some(_) => format!("b/{}", path_str),
+        None => "/dev/null".to_string(),
+    };
+
+    /// Text of one side; `None` when that side is binary. A missing side is empty text.
+    fn text(content: &Option<DiffContent>) -> Option<&str> {
+        match content {
+            Some(DiffContent::Text(text)) => Some(text.as_str()),
+            Some(DiffContent::Binary(_)) => None,
+            None => Some(""),
+        }
+    }
+    match (text(old_content), text(new_content)) {
+        (Some(old), Some(new)) => {
+            output.push_str(&format!("--- {}\n", old_label));
+            output.push_str(&format!("+++ {}\n", new_label));
+            JjBackend::format_hunk(output, old, new);
+        }
+        _ => output.push_str(&format!(
+            "Binary files {} and {} differ\n",
+            old_label, new_label
+        )),
+    }
+}
+
 /// Jujutsu backend using jj-lib for native repo access.
 pub struct JjBackend {
     workspace: Workspace,
@@ -264,47 +334,10 @@ impl JjBackend {
             let old_content = self.get_content_from_value(repo, &entry.path, &diff.before)?;
             let new_content = self.get_content_from_value(repo, &entry.path, &diff.after)?;
 
-            self.format_diff_entry(&mut diff_output, path_str, &old_content, &new_content);
+            format_diff_entry(&mut diff_output, path_str, &old_content, &new_content);
         }
 
         Ok(diff_output)
-    }
-
-    /// Format a single diff entry
-    fn format_diff_entry(
-        &self,
-        output: &mut String,
-        path_str: &str,
-        old_content: &Option<String>,
-        new_content: &Option<String>,
-    ) {
-        if old_content.is_none() && new_content.is_some() {
-            // Added file
-            output.push_str(&format!("diff --git a/{} b/{}\n", path_str, path_str));
-            output.push_str("new file mode 100644\n");
-            output.push_str("--- /dev/null\n");
-            output.push_str(&format!("+++ b/{}\n", path_str));
-            if let Some(content) = new_content {
-                self.format_hunk(output, "", content);
-            }
-        } else if old_content.is_some() && new_content.is_none() {
-            // Deleted file
-            output.push_str(&format!("diff --git a/{} b/{}\n", path_str, path_str));
-            output.push_str("deleted file mode 100644\n");
-            output.push_str(&format!("--- a/{}\n", path_str));
-            output.push_str("+++ /dev/null\n");
-            if let Some(content) = old_content {
-                self.format_hunk(output, content, "");
-            }
-        } else if let (Some(old), Some(new)) = (old_content, new_content) {
-            if old != new {
-                // Modified file
-                output.push_str(&format!("diff --git a/{} b/{}\n", path_str, path_str));
-                output.push_str(&format!("--- a/{}\n", path_str));
-                output.push_str(&format!("+++ b/{}\n", path_str));
-                self.format_hunk(output, old, new);
-            }
-        }
     }
 
     /// Get content from a MergedTreeValue
@@ -313,7 +346,7 @@ impl JjBackend {
         repo: &dyn Repo,
         path: &RepoPath,
         value: &MergedTreeValue,
-    ) -> Result<Option<String>, VcsError> {
+    ) -> Result<Option<DiffContent>, VcsError> {
         // Check if resolved (no conflict)
         if let Some(resolved) = value.as_resolved() {
             match resolved {
@@ -331,14 +364,17 @@ impl JjBackend {
                         .block_on()
                         .map_err(|e| VcsError::Other(format!("failed to read content: {}", e)))?;
 
-                    Ok(Some(String::from_utf8_lossy(&content).into_owned()))
+                    Ok(Some(DiffContent::from_bytes(content)))
                 }
                 None => Ok(None),
                 _ => Ok(None), // Symlink, Tree, etc.
             }
         } else {
-            // Conflict - materialize with proper conflict markers using jj-lib
-            self.materialize_conflict(repo, path, value)
+            // Conflict - materialize with proper conflict markers using jj-lib.
+            // NUL bytes survive the lossy UTF-8 conversion, so binary detection still works.
+            Ok(self
+                .materialize_conflict(repo, path, value)?
+                .map(|text| DiffContent::from_bytes(text.into_bytes())))
         }
     }
 
@@ -382,7 +418,7 @@ impl JjBackend {
 
     /// Format a unified diff using jj-lib's proper diff algorithm.
     /// Produces hunks with context lines for better readability.
-    fn format_hunk(&self, output: &mut String, old: &str, new: &str) {
+    fn format_hunk(output: &mut String, old: &str, new: &str) {
         /// Number of context lines around changes (matches git default of 3)
         const CONTEXT_LINES: usize = 3;
 
@@ -624,7 +660,7 @@ impl VcsBackend for JjBackend {
             let old_content = self.get_content_from_value(repo, &entry.path, &diff.before)?;
             let new_content = self.get_content_from_value(repo, &entry.path, &diff.after)?;
 
-            self.format_diff_entry(&mut diff_output, path_str, &old_content, &new_content);
+            format_diff_entry(&mut diff_output, path_str, &old_content, &new_content);
         }
 
         Ok(diff_output)
@@ -979,6 +1015,75 @@ impl VcsBackend for JjBackend {
 mod tests {
     use super::*;
     use crate::vcs::test_utils::JjRepoGuard;
+
+    fn binary() -> Option<DiffContent> {
+        Some(DiffContent::from_bytes(b"\x89PNG\x00\x01payload".to_vec()))
+    }
+
+    fn text(s: &str) -> Option<DiffContent> {
+        Some(DiffContent::from_bytes(s.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn test_nul_in_probe_window_is_binary() {
+        assert!(matches!(binary(), Some(DiffContent::Binary(_))));
+        let mut late_nul = vec![b'a'; BINARY_PROBE_LEN];
+        late_nul.push(0);
+        assert!(matches!(
+            DiffContent::from_bytes(late_nul),
+            DiffContent::Text(_)
+        ));
+        // Invalid UTF-8 without NUL (e.g. Latin-1) stays text.
+        assert!(matches!(
+            DiffContent::from_bytes(vec![0xE9, b'\n']),
+            DiffContent::Text(_)
+        ));
+    }
+
+    #[test]
+    fn test_added_binary_entry_has_names_only() {
+        let mut out = String::new();
+        format_diff_entry(&mut out, "img/logo.png", &None, &binary());
+        assert_eq!(
+            out,
+            "diff --git a/img/logo.png b/img/logo.png\nnew file mode 100644\n\
+             Binary files /dev/null and b/img/logo.png differ\n"
+        );
+    }
+
+    #[test]
+    fn test_deleted_and_modified_binary_entries_have_names_only() {
+        let mut out = String::new();
+        format_diff_entry(&mut out, "a.bin", &binary(), &None);
+        assert!(out.contains("deleted file mode 100644\n"));
+        assert!(
+            out.ends_with("Binary files a/a.bin and /dev/null differ\n"),
+            "got: {out}"
+        );
+
+        let mut out = String::new();
+        format_diff_entry(&mut out, "a.bin", &text("was text\n"), &binary());
+        assert!(
+            out.ends_with("Binary files a/a.bin and b/a.bin differ\n"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("was text") && !out.contains("payload"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_text_entry_keeps_content_and_unchanged_entry_is_empty() {
+        let mut out = String::new();
+        format_diff_entry(&mut out, "a.txt", &text("old\n"), &text("new\n"));
+        assert!(out.contains("--- a/a.txt\n+++ b/a.txt\n"), "got: {out}");
+        assert!(out.contains("-old") && out.contains("+new"), "got: {out}");
+
+        let mut out = String::new();
+        format_diff_entry(&mut out, "a.bin", &binary(), &binary());
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn test_jj_backend_new_succeeds_on_jj_repo() {
