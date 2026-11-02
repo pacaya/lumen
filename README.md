@@ -247,6 +247,9 @@ lumen draft | git commit -F -
 Configure your preferred AI provider:
 
 ```bash
+# Interactive: stores the API key in the OS secret store (macOS Keychain)
+lumen configure
+
 # Using CLI arguments
 lumen -p openai -k "your-api-key" -m "gpt-5-mini" draft
 
@@ -255,6 +258,18 @@ export LUMEN_AI_PROVIDER="openai"
 export LUMEN_API_KEY="your-api-key"
 export LUMEN_AI_MODEL="gpt-5-mini"
 ```
+
+#### API keys
+
+`lumen configure` saves the key in the OS secret store (macOS Keychain, Windows Credential Manager, Linux Secret Service) as service `lumen`, account = provider id (for example `deepseek`). Each provider has its own key. Lumen looks for a key in this order:
+
+1. `-k` / `--api-key`
+2. `LUMEN_API_KEY`
+3. The provider variable (for example `DEEPSEEK_API_KEY`)
+4. The secret store
+5. `api_key` in the config file (deprecated; `lumen configure` offers to move it to the secret store)
+
+Only `explain`, `draft`, `list` and `operate` read the key. On macOS, an unsigned build (`cargo install`, Nix) can ask for Keychain access again after a rebuild or upgrade.
 
 #### Supported Providers
 
@@ -270,6 +285,11 @@ export LUMEN_AI_MODEL="gpt-5-mini"
 | [Ollama](https://github.com/ollama/ollama) `ollama` | No (local) | [see list](https://ollama.com/library) (default: `llama3.2`) |
 | [OpenRouter](https://openrouter.ai/) `openrouter` | Yes | [see list](https://openrouter.ai/models) (default: `anthropic/claude-sonnet-4.5`) |
 | [Vercel AI Gateway](https://vercel.com/docs/ai-gateway) `vercel` | Yes | [see list](https://vercel.com/docs/ai-gateway/supported-models) (default: `anthropic/claude-sonnet-4.5`) |
+| Apple Foundation Models `apple` | No (macOS, uses `fm`) | `system` (on-device), `pcc` (Private Cloud Compute, needs iCloud sign-in) (default: `system`) |
+
+Any model name works with any provider: lumen always sends the request to the selected provider, never to a provider guessed from the model name.
+
+The on-device Apple model has a small context (about 4k tokens). For larger diffs use `-m pcc` or another provider.
 
 ## Coding Agent Integrations 🔅
 
@@ -316,8 +336,11 @@ Lumen will load configurations in the following order of priority:
 ```json
 {
   "provider": "openai",
-  "model": "gpt-5-mini",
-  "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "providers": {
+    "openai": { "model": "gpt-5-mini" },
+    "apple": { "model": "pcc" },
+    "ollama": { "model": "llama3.2", "base_url": "http://my-server:11434/v1/" }
+  },
   "theme": "catppuccin-mocha",
   "wrap": true,
   "draft": {
@@ -338,12 +361,16 @@ Lumen will load configurations in the following order of priority:
 }
 ```
 
+`providers.<id>` holds per-provider settings: `model` and `base_url` (endpoint override). A top-level `model` still works, but `providers.<id>.model` has priority.
+
 ### Configuration Precedence
 Options are applied in the following order (highest to lowest priority):
 1. CLI Flags
 2. Configuration File
 3. Environment Variables
 4. Default options
+
+Model: `-m`, then `providers.<id>.model`, then top-level `model`, then `LUMEN_AI_MODEL`, then the provider default. For API keys, see [API keys](#api-keys) (environment variables have priority over stored keys).
 
 Example: Using different providers for different projects:
 ```bash
