@@ -1,6 +1,7 @@
 use crate::config::cli::ProviderType;
 use crate::config::ProviderInfo;
 use crate::error::LumenError;
+use crate::prompt_budget::DEFAULT_MAX_INPUT_TOKENS;
 use dirs::home_dir;
 use indoc::indoc;
 use serde::{Deserialize, Deserializer};
@@ -24,6 +25,8 @@ pub struct LumenConfig {
     pub draft: DraftConfig,
     pub theme: Option<String>,
     pub wrap: Option<bool>,
+    /// Input-token budget for prompts that contain a diff.
+    pub max_input_tokens: usize,
 }
 
 /// Per-provider settings under the `providers` object of the config file.
@@ -33,6 +36,9 @@ pub struct ProviderSettings {
     pub model: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Input-token budget. Default: [`DEFAULT_MAX_INPUT_TOKENS`].
+    #[serde(default)]
+    pub max_input_tokens: Option<usize>,
 }
 
 /// The config file as written on disk.
@@ -171,10 +177,11 @@ impl LumenConfig {
     fn resolve(cli: &Cli, file: FileConfig, env_model: Option<String>) -> Self {
         let provider = cli.provider.unwrap_or(file.provider);
         let model = resolve_model(cli.model.as_deref(), &file, provider, env_model);
-        let base_url = file
-            .providers
-            .get(ProviderInfo::for_provider(provider).id)
-            .and_then(|p| p.base_url.clone());
+        let settings = file.providers.get(ProviderInfo::for_provider(provider).id);
+        let base_url = settings.and_then(|p| p.base_url.clone());
+        let max_input_tokens = settings
+            .and_then(|p| p.max_input_tokens)
+            .unwrap_or(DEFAULT_MAX_INPUT_TOKENS);
 
         LumenConfig {
             provider,
@@ -185,6 +192,7 @@ impl LumenConfig {
             draft: file.draft,
             theme: file.theme,
             wrap: file.wrap,
+            max_input_tokens,
         }
     }
 }
@@ -251,6 +259,19 @@ mod tests {
         let f = file(r#"{"provider":"deepseek","model":"top"}"#);
         let c = LumenConfig::resolve(&cli(&[]), f, Some("env".into()));
         assert_eq!(c.model.as_deref(), Some("top"));
+    }
+
+    #[test]
+    fn max_input_tokens_defaults_and_uses_active_provider_setting() {
+        let f = file(r#"{"provider":"deepseek"}"#);
+        let c = LumenConfig::resolve(&cli(&[]), f, None);
+        assert_eq!(c.max_input_tokens, DEFAULT_MAX_INPUT_TOKENS);
+
+        let f = file(
+            r#"{"provider":"deepseek","providers":{"deepseek":{"max_input_tokens":900000},"openai":{"max_input_tokens":5}}}"#,
+        );
+        let c = LumenConfig::resolve(&cli(&[]), f, None);
+        assert_eq!(c.max_input_tokens, 900_000);
     }
 
     #[test]

@@ -14,6 +14,16 @@ pub enum GitEntity {
 }
 
 impl GitEntity {
+    /// The diff text that is sent to the AI.
+    pub fn diff_text(&self) -> &str {
+        match self {
+            GitEntity::Commit(commit) => &commit.diff,
+            GitEntity::Diff(Diff::WorkingTree { diff, .. } | Diff::CommitsRange { diff, .. }) => {
+                diff
+            }
+        }
+    }
+
     pub fn format_static_details(&self, provider: &LumenProvider) -> String {
         match self {
             GitEntity::Commit(commit) => formatdoc! {"
