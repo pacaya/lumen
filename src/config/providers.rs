@@ -87,9 +87,22 @@ pub const ALL_PROVIDERS: &[ProviderInfo] = &[
         default_model: "anthropic/claude-sonnet-4.5",
         env_key: "VERCEL_API_KEY",
     },
+    ProviderInfo {
+        id: "apple",
+        provider_type: ProviderType::Apple,
+        display_name: "Apple Foundation Models",
+        // `system` = on-device; `pcc` = Private Cloud Compute (needs iCloud).
+        default_model: "system",
+        env_key: "",
+    },
 ];
 
 impl ProviderInfo {
+    /// Providers that can run on this platform. Apple Foundation Models is macOS-only.
+    pub fn available_here(&self) -> bool {
+        self.provider_type != ProviderType::Apple || cfg!(target_os = "macos")
+    }
+
     /// Providers with an empty `env_key` run locally and need no API key.
     pub fn requires_key(&self) -> bool {
         !self.env_key.is_empty()

@@ -4,6 +4,8 @@ use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ClientBuilder, ModelIden, ServiceTarget};
 use thiserror::Error;
 
+mod apple_fm;
+
 use crate::ai_prompt::{AIPrompt, AIPromptError};
 use crate::command::{draft::DraftCommand, explain::ExplainCommand, operate::OperateCommand};
 use crate::config::cli::ProviderType;
@@ -23,10 +25,20 @@ pub enum ProviderError {
 
     #[error(transparent)]
     AIPromptError(#[from] AIPromptError),
+
+    #[error("Apple Foundation Models CLI '{0}' not found. It ships as /usr/bin/fm on supported macOS versions.")]
+    AppleFmNotFound(String),
+
+    #[error("Apple Foundation Models: {0}")]
+    AppleContextExceeded(String),
+
+    #[error("Apple Foundation Models request failed: {0}")]
+    AppleFmFailed(String),
 }
 
 enum ProviderBackend {
     GenAI { client: Client, model: String },
+    AppleFm { program: String, model: String },
 }
 
 pub struct LumenProvider {
@@ -34,13 +46,23 @@ pub struct LumenProvider {
     provider_name: String,
 }
 
-/// Explicit genai adapter and default endpoint for a provider.
+/// How a provider is reached.
+#[derive(Debug, PartialEq)]
+enum Route {
+    /// genai with an explicit adapter and default endpoint.
+    GenAI(AdapterKind, &'static str),
+    /// The local `fm` CLI.
+    AppleFm,
+}
+
+/// Explicit route for a provider.
 ///
 /// Every provider maps to its own adapter here. lumen never lets genai infer the
 /// adapter from the model name: genai falls back to Ollama for any name it does
 /// not know (for example a new DeepSeek model).
-fn genai_route(provider: ProviderType, model: &str) -> (AdapterKind, &'static str) {
-    match provider {
+fn route(provider: ProviderType, model: &str) -> Route {
+    let (kind, endpoint) = match provider {
+        ProviderType::Apple => return Route::AppleFm,
         // OpenAI serves some models (codex, pro) only via the Responses API.
         ProviderType::Openai => match AdapterKind::from_model(model) {
             Ok(AdapterKind::OpenAIResp) => (AdapterKind::OpenAIResp, "https://api.openai.com/v1/"),
@@ -59,7 +81,8 @@ fn genai_route(provider: ProviderType, model: &str) -> (AdapterKind, &'static st
         ProviderType::Openrouter => (AdapterKind::OpenAI, "https://openrouter.ai/api/v1/"),
         // Trailing slash is required for URL joining to work correctly
         ProviderType::Vercel => (AdapterKind::OpenAI, "https://ai-gateway.vercel.sh/v1/"),
-    }
+    };
+    Route::GenAI(kind, endpoint)
 }
 
 /// Builds the service target for a request. The endpoint and adapter come only
@@ -71,7 +94,9 @@ fn service_target(
     api_key: Option<&str>,
 ) -> ServiceTarget {
     let defaults = ProviderInfo::for_provider(provider);
-    let (adapter_kind, default_endpoint) = genai_route(provider, model);
+    let Route::GenAI(adapter_kind, default_endpoint) = route(provider, model) else {
+        unreachable!("service_target is only built for genai providers")
+    };
 
     let endpoint = match base_url {
         Some(url) if url.ends_with('/') => Endpoint::from_owned(url.to_string()),
@@ -101,6 +126,16 @@ impl LumenProvider {
     ) -> Result<Self, LumenError> {
         let defaults = ProviderInfo::for_provider(provider_type);
         let model = model.unwrap_or_else(|| defaults.default_model.to_string());
+
+        if route(provider_type, &model) == Route::AppleFm {
+            return Ok(Self {
+                backend: ProviderBackend::AppleFm {
+                    program: "fm".to_string(),
+                    model,
+                },
+                provider_name: defaults.display_name.to_string(),
+            });
+        }
 
         let target_resolver = ServiceTargetResolver::from_resolver_fn(
             move |target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
@@ -138,6 +173,9 @@ impl LumenProvider {
                     .map(|s| s.to_string())
                     .ok_or(ProviderError::NoCompletionChoice)
             }
+            ProviderBackend::AppleFm { program, model } => {
+                apple_fm::complete(program, model, &prompt.system_prompt, &prompt.user_prompt).await
+            }
         }
     }
 
@@ -158,7 +196,9 @@ impl LumenProvider {
 
     fn get_model(&self) -> String {
         match &self.backend {
-            ProviderBackend::GenAI { model, .. } => model.clone(),
+            ProviderBackend::GenAI { model, .. } | ProviderBackend::AppleFm { model, .. } => {
+                model.clone()
+            }
         }
     }
 }
@@ -186,6 +226,7 @@ mod tests {
             ProviderType::Xai => AdapterKind::Xai,
             ProviderType::Deepseek => AdapterKind::DeepSeek,
             ProviderType::Ollama => AdapterKind::Ollama,
+            ProviderType::Apple => unreachable!("not a genai provider"),
         }
     }
 
@@ -206,7 +247,10 @@ mod tests {
             "deepseek-chat",
             "grok-4",
         ] {
-            for info in ALL_PROVIDERS {
+            for info in ALL_PROVIDERS
+                .iter()
+                .filter(|p| p.provider_type != ProviderType::Apple)
+            {
                 let t = service_target(info.provider_type, name, None, None);
                 assert_eq!(
                     t.model.adapter_kind,
@@ -216,6 +260,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn apple_routes_to_fm_for_any_model_name() {
+        for name in ["system", "pcc", "gpt-5"] {
+            assert_eq!(route(ProviderType::Apple, name), Route::AppleFm);
+        }
+    }
+
+    #[test]
+    fn apple_provider_defaults_to_on_device_model() {
+        let p = LumenProvider::new(ProviderType::Apple, None, None, None).unwrap();
+        assert_eq!(p.to_string(), "Apple Foundation Models (system)");
+        let p = LumenProvider::new(ProviderType::Apple, None, Some("pcc".into()), None).unwrap();
+        assert_eq!(p.to_string(), "Apple Foundation Models (pcc)");
     }
 
     #[test]

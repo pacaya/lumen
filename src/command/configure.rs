@@ -152,7 +152,11 @@ impl ConfigureCommand {
 
     /// Prompts the user to select an AI provider from the supported list.
     fn select_provider() -> Result<&'static ProviderInfo, LumenError> {
-        let options: Vec<ProviderChoice> = ALL_PROVIDERS.iter().map(ProviderChoice).collect();
+        let options: Vec<ProviderChoice> = ALL_PROVIDERS
+            .iter()
+            .filter(|p| p.available_here())
+            .map(ProviderChoice)
+            .collect();
 
         let selection = Select::new("Select your default AI provider:", options)
             .with_help_message("↑↓ to move, enter to select, type to filter")
