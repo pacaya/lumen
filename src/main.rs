@@ -15,6 +15,7 @@ mod commit_reference;
 mod config;
 mod error;
 mod git_entity;
+mod prompt_budget;
 mod provider;
 mod vcs;
 
@@ -171,6 +172,7 @@ fn build_command(config: &LumenConfig) -> Result<LumenCommand, LumenError> {
         api_key,
         config.model.clone(),
         config.base_url.clone(),
+        config.max_input_tokens,
     )?;
     Ok(LumenCommand::new(provider))
 }

@@ -6,11 +6,12 @@ use thiserror::Error;
 
 mod apple_fm;
 
-use crate::ai_prompt::{AIPrompt, AIPromptError};
+use crate::ai_prompt::{AIPrompt, AIPromptError, PromptDiff};
 use crate::command::{draft::DraftCommand, explain::ExplainCommand, operate::OperateCommand};
 use crate::config::cli::ProviderType;
 use crate::config::ProviderInfo;
 use crate::error::LumenError;
+use crate::prompt_budget::{estimate_tokens, fit_diff, CHARS_PER_TOKEN};
 
 #[derive(Error, Debug)]
 pub enum ProviderError {
@@ -34,6 +35,9 @@ pub enum ProviderError {
 
     #[error("Apple Foundation Models request failed: {0}")]
     AppleFmFailed(String),
+
+    #[error("prompt is too large: about {estimated} tokens, but the budget is {budget} tokens, even with only the list of changed files. Make the change smaller, or raise `max_input_tokens` under `providers.<provider>` in the lumen config.")]
+    PromptOverBudget { estimated: usize, budget: usize },
 }
 
 enum ProviderBackend {
@@ -44,6 +48,8 @@ enum ProviderBackend {
 pub struct LumenProvider {
     backend: ProviderBackend,
     provider_name: String,
+    /// Input-token budget for prompts that contain a diff.
+    max_input_tokens: usize,
 }
 
 /// How a provider is reached.
@@ -117,12 +123,52 @@ fn service_target(
     }
 }
 
+/// Build a prompt that fits the input-token budget.
+///
+/// The full diff is used when it fits. Otherwise the largest file bodies are
+/// replaced by summary lines, a note goes to stderr, and the prompt names the
+/// omitted files. Fails when even the list of changed files does not fit.
+fn fit_prompt(
+    max_input_tokens: usize,
+    diff: &str,
+    build: impl Fn(&PromptDiff) -> Result<AIPrompt, AIPromptError>,
+) -> Result<AIPrompt, ProviderError> {
+    let budget_chars = max_input_tokens.saturating_mul(CHARS_PER_TOKEN);
+    let full = build(&PromptDiff::full(diff))?;
+    let full_chars = full.chars();
+    if full_chars <= budget_chars {
+        return Ok(full);
+    }
+
+    let over_budget = || ProviderError::PromptOverBudget {
+        estimated: estimate_tokens(full_chars),
+        budget: max_input_tokens,
+    };
+    let overhead = full_chars.saturating_sub(diff.chars().count());
+    let available = budget_chars.checked_sub(overhead).ok_or_else(over_budget)?;
+    let fitted = fit_diff(diff, available).ok_or_else(over_budget)?;
+
+    let prompt = build(&PromptDiff {
+        text: &fitted.text,
+        omitted: &fitted.omitted,
+    })?;
+    if prompt.chars() > budget_chars {
+        return Err(over_budget());
+    }
+    eprintln!(
+        "note: diff content of {} file(s) omitted (prompt over the {max_input_tokens}-token budget)",
+        fitted.omitted.len()
+    );
+    Ok(prompt)
+}
+
 impl LumenProvider {
     pub fn new(
         provider_type: ProviderType,
         api_key: Option<String>,
         model: Option<String>,
         base_url: Option<String>,
+        max_input_tokens: usize,
     ) -> Result<Self, LumenError> {
         let defaults = ProviderInfo::for_provider(provider_type);
         let model = model.unwrap_or_else(|| defaults.default_model.to_string());
@@ -134,6 +180,7 @@ impl LumenProvider {
                     model,
                 },
                 provider_name: defaults.display_name.to_string(),
+                max_input_tokens,
             });
         }
 
@@ -155,6 +202,7 @@ impl LumenProvider {
         Ok(Self {
             backend: ProviderBackend::GenAI { client, model },
             provider_name: defaults.display_name.to_string(),
+            max_input_tokens,
         })
     }
 
@@ -180,12 +228,20 @@ impl LumenProvider {
     }
 
     pub async fn explain(&self, command: &ExplainCommand) -> Result<String, ProviderError> {
-        let prompt = AIPrompt::build_explain_prompt(command)?;
+        let prompt = fit_prompt(
+            self.max_input_tokens,
+            command.git_entity.diff_text(),
+            |diff| AIPrompt::build_explain_prompt(command, diff),
+        )?;
         self.complete(prompt).await
     }
 
     pub async fn draft(&self, command: &DraftCommand) -> Result<String, ProviderError> {
-        let prompt = AIPrompt::build_draft_prompt(command)?;
+        let prompt = fit_prompt(
+            self.max_input_tokens,
+            command.git_entity.diff_text(),
+            |diff| AIPrompt::build_draft_prompt(command, diff),
+        )?;
         self.complete(prompt).await
     }
 
@@ -213,6 +269,56 @@ impl std::fmt::Display for LumenProvider {
 mod tests {
     use super::*;
     use crate::config::ALL_PROVIDERS;
+
+    /// Test prompt builder: a fixed system prompt plus the diff and the omitted-files note.
+    fn echo_prompt(diff: &PromptDiff) -> Result<AIPrompt, AIPromptError> {
+        Ok(AIPrompt {
+            system_prompt: "system".to_string(),
+            user_prompt: format!("{}|omitted={}", diff.text, diff.omitted.join(",")),
+        })
+    }
+
+    fn file(path: &str, lines: usize) -> String {
+        let mut s =
+            format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n");
+        for i in 0..lines {
+            s.push_str(&format!("+{i} {path}\n"));
+        }
+        s
+    }
+
+    #[test]
+    fn prompt_within_budget_keeps_full_diff() {
+        let diff = file("a.rs", 10);
+        let p = fit_prompt(10_000, &diff, echo_prompt).unwrap();
+        assert_eq!(p.user_prompt, format!("{diff}|omitted="));
+    }
+
+    #[test]
+    fn prompt_over_budget_omits_largest_file_and_names_it() {
+        let diff = format!("{}{}", file("small.rs", 3), file("huge.bin.js", 20_000));
+        let p = fit_prompt(500, &diff, echo_prompt).unwrap();
+        assert!(p.chars() <= 500 * CHARS_PER_TOKEN);
+        assert!(
+            p.user_prompt.contains("+2 small.rs"),
+            "small file keeps content"
+        );
+        assert!(p
+            .user_prompt
+            .contains("huge.bin.js: +20000 -0 lines (diff omitted)"));
+        assert!(p.user_prompt.ends_with("|omitted=huge.bin.js"));
+    }
+
+    #[test]
+    fn prompt_fails_when_file_list_does_not_fit() {
+        let diff: String = (0..200).map(|i| file(&format!("f{i}.rs"), 5)).collect();
+        let err = fit_prompt(100, &diff, echo_prompt).unwrap_err();
+        let ProviderError::PromptOverBudget { estimated, budget } = err else {
+            panic!("expected PromptOverBudget, got {err:?}");
+        };
+        assert_eq!(budget, 100);
+        assert!(estimated > budget);
+    }
 
     fn expected_adapter(provider: ProviderType) -> AdapterKind {
         match provider {
@@ -271,9 +377,10 @@ mod tests {
 
     #[test]
     fn apple_provider_defaults_to_on_device_model() {
-        let p = LumenProvider::new(ProviderType::Apple, None, None, None).unwrap();
+        let p = LumenProvider::new(ProviderType::Apple, None, None, None, 1_000).unwrap();
         assert_eq!(p.to_string(), "Apple Foundation Models (system)");
-        let p = LumenProvider::new(ProviderType::Apple, None, Some("pcc".into()), None).unwrap();
+        let p =
+            LumenProvider::new(ProviderType::Apple, None, Some("pcc".into()), None, 1_000).unwrap();
         assert_eq!(p.to_string(), "Apple Foundation Models (pcc)");
     }
 

@@ -242,6 +242,14 @@ lumen draft | git commit -F -
 
 [lazygit](https://github.com/jesseduffield/lazygit) integration is available — see the [user config docs](https://github.com/jesseduffield/lazygit/blob/master/docs/Config.md) for binding `lumen draft` to a custom command.
 
+### What is sent to the AI
+
+`draft` and `explain` send the diff, with these limits:
+
+- **Binary files** are sent by name only (`Binary files a/x.png and b/x.png differ`), never their content. With git, a `.gitattributes` entry such as `*.min.js -diff` does the same for text files.
+- **Lock files** (`Cargo.lock`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`) and `node_modules/` are not sent.
+- **Token budget**: lumen estimates the prompt size (characters ÷ 4) before it sends the request. The default budget is 100,000 tokens; set `providers.<id>.max_input_tokens` to change it. When the prompt is over budget, the largest files are sent as `path: +X -Y lines (diff omitted)` until it fits, the model is told which files have no content, and a note is written to stderr. If even the list of changed files does not fit, lumen stops with an error.
+
 ### AI Providers
 
 Configure your preferred AI provider:
@@ -339,7 +347,8 @@ Lumen will load configurations in the following order of priority:
   "providers": {
     "openai": { "model": "gpt-5-mini" },
     "apple": { "model": "pcc" },
-    "ollama": { "model": "llama3.2", "base_url": "http://my-server:11434/v1/" }
+    "ollama": { "model": "llama3.2", "base_url": "http://my-server:11434/v1/" },
+    "deepseek": { "model": "deepseek-chat", "max_input_tokens": 900000 }
   },
   "theme": "catppuccin-mocha",
   "wrap": true,
@@ -361,7 +370,7 @@ Lumen will load configurations in the following order of priority:
 }
 ```
 
-`providers.<id>` holds per-provider settings: `model` and `base_url` (endpoint override). A top-level `model` still works, but `providers.<id>.model` has priority.
+`providers.<id>` holds per-provider settings: `model`, `base_url` (endpoint override), and `max_input_tokens` (prompt budget, see [What is sent to the AI](#what-is-sent-to-the-ai)). A top-level `model` still works, but `providers.<id>.model` has priority.
 
 ### Configuration Precedence
 Options are applied in the following order (highest to lowest priority):

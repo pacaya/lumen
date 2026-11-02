@@ -183,7 +183,6 @@ impl GitBackend {
 
         // Create diff with options
         let mut opts = DiffOptions::new();
-        opts.show_binary(true);
         opts.context_lines(3);
 
         let diff = self
@@ -272,7 +271,6 @@ impl VcsBackend for GitBackend {
 
     fn get_working_tree_diff(&self, staged: bool) -> Result<String, VcsError> {
         let mut opts = DiffOptions::new();
-        opts.show_binary(true);
         opts.context_lines(3);
 
         let diff = if staged {
@@ -367,7 +365,6 @@ impl VcsBackend for GitBackend {
             .map_err(|e| VcsError::Other(format!("failed to get to tree: {}", e)))?;
 
         let mut opts = DiffOptions::new();
-        opts.show_binary(true);
         opts.context_lines(3);
 
         let diff = self
@@ -1138,6 +1135,75 @@ mod tests {
         // Cleanup
         let _ = std::env::set_current_dir(&original);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PNG-like bytes: a NUL byte early makes git classify the file as binary.
+    const BINARY_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x01\x02\x03payload";
+
+    fn assert_binary_names_only(diff: &str, path: &str) {
+        assert!(
+            diff.contains(&format!("Binary files /dev/null and b/{path} differ")),
+            "diff should name the binary file, got: {diff}"
+        );
+        assert!(
+            !diff.contains("GIT binary patch") && !diff.contains("literal "),
+            "diff must not contain binary content, got: {diff}"
+        );
+    }
+
+    #[test]
+    fn test_staged_binary_file_is_named_without_content() {
+        let repo = RepoGuard::new();
+        std::fs::write(repo.dir.join("logo.png"), BINARY_BYTES).expect("write binary");
+        crate::vcs::test_utils::git(&repo.dir, &["add", "logo.png"]);
+
+        let backend = GitBackend::from_cwd().expect("should open repo");
+        let diff = backend
+            .get_working_tree_diff(true)
+            .expect("should get diff");
+
+        assert!(
+            diff.contains("diff --git a/logo.png b/logo.png"),
+            "got: {diff}"
+        );
+        assert!(diff.contains("new file mode"), "got: {diff}");
+        assert_binary_names_only(&diff, "logo.png");
+    }
+
+    #[test]
+    fn test_commit_and_range_binary_file_is_named_without_content() {
+        let repo = RepoGuard::new();
+        std::fs::write(repo.dir.join("logo.png"), BINARY_BYTES).expect("write binary");
+        crate::vcs::test_utils::git(&repo.dir, &["add", "logo.png"]);
+        crate::vcs::test_utils::git(&repo.dir, &["commit", "-m", "add logo"]);
+
+        let backend = GitBackend::from_cwd().expect("should open repo");
+        let commit = backend.get_commit("HEAD").expect("should get commit");
+        assert_binary_names_only(&commit.diff, "logo.png");
+
+        let range = backend
+            .get_range_diff("HEAD~1", "HEAD", false)
+            .expect("should get range diff");
+        assert_binary_names_only(&range, "logo.png");
+    }
+
+    #[test]
+    fn test_gitattributes_no_diff_hides_text_content() {
+        let repo = RepoGuard::new();
+        std::fs::write(repo.dir.join(".gitattributes"), "*.min.js -diff\n").expect("write attrs");
+        std::fs::write(repo.dir.join("app.min.js"), "var secretBody=1;\n").expect("write js");
+        crate::vcs::test_utils::git(&repo.dir, &["add", "."]);
+
+        let backend = GitBackend::from_cwd().expect("should open repo");
+        let diff = backend
+            .get_working_tree_diff(true)
+            .expect("should get diff");
+
+        assert!(
+            diff.contains("Binary files /dev/null and b/app.min.js differ"),
+            "-diff file should be named only, got: {diff}"
+        );
+        assert!(!diff.contains("secretBody"), "got: {diff}");
     }
 
     #[test]

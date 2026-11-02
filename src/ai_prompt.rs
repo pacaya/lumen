@@ -9,13 +9,49 @@ use thiserror::Error;
 #[error("{0}")]
 pub struct AIPromptError(String);
 
+#[derive(Debug)]
 pub struct AIPrompt {
     pub system_prompt: String,
     pub user_prompt: String,
 }
 
+/// The diff text put into a prompt, and the files whose content it omits.
+pub struct PromptDiff<'a> {
+    pub text: &'a str,
+    pub omitted: &'a [String],
+}
+
+impl<'a> PromptDiff<'a> {
+    /// The complete diff, with nothing omitted.
+    pub fn full(text: &'a str) -> Self {
+        PromptDiff { text, omitted: &[] }
+    }
+
+    /// Tells the model which files have no content in the diff.
+    fn omitted_note(&self) -> String {
+        if self.omitted.is_empty() {
+            return String::new();
+        }
+        formatdoc! {"
+
+            Note: the prompt was too large, so the diff content of these files is omitted and only their names and line counts are shown: {files}.
+            Do not guess the content of these files. If a question needs it, say that the content is not available.
+            ",
+            files = self.omitted.join(", ")
+        }
+    }
+}
+
 impl AIPrompt {
-    pub fn build_explain_prompt(command: &ExplainCommand) -> Result<Self, AIPromptError> {
+    /// Characters in the system and user prompts, for the token estimate.
+    pub fn chars(&self) -> usize {
+        self.system_prompt.chars().count() + self.user_prompt.chars().count()
+    }
+
+    pub fn build_explain_prompt(
+        command: &ExplainCommand,
+        diff: &PromptDiff,
+    ) -> Result<Self, AIPromptError> {
         let system_prompt = String::from(indoc! {"
             You are a helpful assistant that explains Git changes in a concise way.
             Focus only on the most significant changes and their direct impact.
@@ -34,19 +70,22 @@ impl AIPrompt {
                     ```diff
                     {diff}
                     ```
-                    ",
+                    {note}",
                     msg = commit.message,
-                    diff = commit.diff
+                    diff = diff.text,
+                    note = diff.omitted_note(),
                 }
             }
-            GitEntity::Diff(Diff::WorkingTree { diff, .. } | Diff::CommitsRange { diff, .. }) => {
+            GitEntity::Diff(_) => {
                 formatdoc! {"
                     Context - Changes:
 
                     ```diff
                     {diff}
                     ```
-                    "
+                    {note}",
+                    diff = diff.text,
+                    note = diff.omitted_note(),
                 }
             }
         };
@@ -96,8 +135,11 @@ impl AIPrompt {
         })
     }
 
-    pub fn build_draft_prompt(command: &DraftCommand) -> Result<Self, AIPromptError> {
-        let GitEntity::Diff(Diff::WorkingTree { diff, .. }) = &command.git_entity else {
+    pub fn build_draft_prompt(
+        command: &DraftCommand,
+        diff: &PromptDiff,
+    ) -> Result<Self, AIPromptError> {
+        let GitEntity::Diff(Diff::WorkingTree { .. }) = &command.git_entity else {
             return Err(AIPromptError(
                 "`draft` is only supported for working tree diffs".into(),
             ));
@@ -138,8 +180,10 @@ impl AIPrompt {
             ```diff
             {diff}
             ```
-            ",
+            {note}",
             commit_types = command.draft_config.commit_types,
+            diff = diff.text,
+            note = diff.omitted_note(),
         };
 
         Ok(AIPrompt {
